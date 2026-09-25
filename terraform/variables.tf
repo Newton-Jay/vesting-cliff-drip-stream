@@ -38,3 +38,9 @@ variable "cost_alert_emails" {
   description = "Email recipients for budget and Cost Explorer anomaly alerts."
   type        = set(string)
 }
+
+variable "deployment_alert_emails" {
+  description = "Email recipients for CodeDeploy lifecycle notifications."
+  type        = set(string)
+  default     = []
+}
