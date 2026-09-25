@@ -26,3 +26,27 @@ variable "container_memory" {
   type        = number
   default     = 512
 }
+
+variable "aws_region" {
+  description = "AWS region for regional WAF and CloudWatch resources"
+  type        = string
+  default     = "us-east-1"
+}
+
+variable "waf_rate_limit" {
+  description = "Requests per IP allowed during the WAF evaluation window"
+  type        = number
+  default     = 1000
+}
+
+variable "waf_sanctioned_country_codes" {
+  description = "ISO country codes blocked by the geo rule"
+  type        = list(string)
+  default     = ["AF", "BY", "CU", "IR", "KP", "LY", "MM", "RU", "SD", "SS", "SY", "VE", "YE", "ZW"]
+}
+
+variable "waf_log_retention_days" {
+  description = "Retention period for WAF decision logs"
+  type        = number
+  default     = 90
+}
