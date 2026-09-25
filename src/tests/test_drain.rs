@@ -49,7 +49,7 @@ fn setup_drain_stream(
     mint_to(env, &token_id, &sponsor, 2_000);
 
     client
-        .create_vesting_stream(&sponsor, &recipient, &token_id, &10, &50, &200)
+        .create_vesting_stream(&sponsor, &recipient, &token_id, &10, &50, &200, &None)
         .unwrap();
 
     (contract_id, client, sponsor, recipient, token_id)
@@ -112,7 +112,7 @@ fn test_drain_partial_claim_then_drain() {
 
     // Recipient claims at cliff (ledger 150 → claimed 500).
     advance_ledger_high_ttl(&env, 50);
-    client.claim_vested(&recipient).unwrap();
+    client.claim_vested(&recipient);
 
     // Advance past drain threshold.
     advance_ledger_high_ttl(&env, DRAIN_DELAY_LEDGERS + 151);

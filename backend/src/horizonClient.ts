@@ -9,11 +9,28 @@
  * The W3C TraceContext propagator (configured in tracing.ts) injects
  * `traceparent` / `tracestate` headers into every outbound request, allowing
  * correlation across services that support the standard.
+ *
+ * Additionally, the current request_id is forwarded as `X-Request-ID` so that
+ * Horizon-side logs can be correlated back to the originating request.
  */
 
 import * as http from 'http';
 import * as https from 'https';
 import { context, trace, SpanKind, SpanStatusCode } from '@opentelemetry/api';
+import { horizonCircuitBreaker, CircuitOpenError } from './horizonCircuitBreaker.js';
+
+// Import request_id accessor from logger.  The import is resolved at runtime;
+// if the module is unavailable in a test environment the fallback returns null.
+let getRequestIdFn: () => string | null = () => null;
+try {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const loggerModule = require('./logger.js');
+  if (typeof loggerModule.getRequestId === 'function') {
+    getRequestIdFn = loggerModule.getRequestId;
+  }
+} catch {
+  // logger not available — proceed without request_id propagation
+}
 
 const tracer = trace.getTracer('horizon-client', '1.0.0');
 
@@ -26,8 +43,15 @@ export interface HorizonResponse<T = unknown> {
  * Performs a GET request to the configured Horizon base URL and returns the
  * parsed JSON body.
  *
+ * Requests are wrapped by the module-level `horizonCircuitBreaker`.
+ * - When the circuit is CLOSED or HALF-OPEN, the request is attempted normally.
+ * - When the circuit is OPEN, a `CircuitOpenError` is thrown immediately
+ *   without making a network call, allowing callers to return 503 fast.
+ *
  * A child span named `horizon.get` is created and attached to the current
  * active context so it nests correctly inside the parent HTTP request span.
+ * The `X-Request-ID` header is forwarded so Horizon-side logs can be
+ * correlated with the originating request.
  */
 export async function horizonGet<T = unknown>(
   baseUrl: string,
@@ -38,25 +62,34 @@ export async function horizonGet<T = unknown>(
     {
       kind: SpanKind.CLIENT,
       attributes: {
-        'horizon.base_url': baseUrl,
-        'horizon.path':     path,
-        'http.method':      'GET',
-        'http.url':         `${baseUrl}${path}`,
+        'horizon.base_url':     baseUrl,
+        'horizon.path':         path,
+        'http.method':          'GET',
+        'http.url':             `${baseUrl}${path}`,
+        'circuit_breaker.state': horizonCircuitBreaker.getState(),
       },
     },
     async (span) => {
       try {
-        const result = await httpGet<T>(`${baseUrl}${path}`);
+        const result = await horizonCircuitBreaker.execute(
+          () => httpGet<T>(`${baseUrl}${path}`),
+        );
         span.setAttributes({
-          'http.status_code': result.status,
+          'http.status_code':      result.status,
+          'circuit_breaker.state': horizonCircuitBreaker.getState(),
         });
         if (result.status >= 400) {
           span.setStatus({ code: SpanStatusCode.ERROR, message: `HTTP ${result.status}` });
         }
         return result;
       } catch (err) {
-        span.setStatus({ code: SpanStatusCode.ERROR, message: String(err) });
-        span.recordException(err as Error);
+        if (err instanceof CircuitOpenError) {
+          span.setAttributes({ 'circuit_breaker.state': 'open' });
+          span.setStatus({ code: SpanStatusCode.ERROR, message: 'circuit open' });
+        } else {
+          span.setStatus({ code: SpanStatusCode.ERROR, message: String(err) });
+          span.recordException(err as Error);
+        }
         throw err;
       } finally {
         span.end();
@@ -65,12 +98,24 @@ export async function horizonGet<T = unknown>(
   );
 }
 
+// Re-export for callers that need to check or reset the breaker directly.
+export { horizonCircuitBreaker, CircuitOpenError } from './horizonCircuitBreaker.js';
+
 // ── Internal HTTP helper ──────────────────────────────────────────────────────
 
 function httpGet<T>(url: string): Promise<HorizonResponse<T>> {
+  // Read the current request_id from AsyncLocalStorage so we can forward it.
+  const requestId = getRequestIdFn();
+
   return new Promise((resolve, reject) => {
     const lib = url.startsWith('https') ? https : http;
-    const req = lib.get(url, (res) => {
+
+    const options: http.RequestOptions = { method: 'GET' };
+    if (requestId) {
+      options.headers = { 'X-Request-ID': requestId };
+    }
+
+    const req = lib.get(url, options, (res) => {
       const chunks: Buffer[] = [];
       res.on('data', (chunk: Buffer) => chunks.push(chunk));
       res.on('end', () => {
