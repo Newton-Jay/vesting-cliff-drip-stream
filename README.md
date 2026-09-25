@@ -6,6 +6,8 @@ A production-ready Soroban smart contract that combines a **time-locked cliff** 
 
 > Coming from standard Drips? See the [comparison guide](docs/comparison.md) for a feature table, cancel behaviour details, and migration instructions.
 >
+> Setting up a local development environment? See the [Developer Onboarding Guide](docs/developer-onboarding.md) for step-by-step instructions.
+>
 > Have a question? Check the [FAQ](docs/faq.md) for common answers about stream lifecycle, claiming, token support, and fees.
 
 ---
@@ -115,6 +117,7 @@ A [scheduled GitHub Actions workflow](.github/workflows/drift-detection.yml) run
 | [Emergency Override](docs/runbooks/emergency-override.md) | Manual infrastructure changes with required post-hoc Terraform update |
 | [RDS Restore](docs/runbooks/rds-restore.md) | Database snapshot restore procedure |
 | [Disaster Recovery](docs/runbooks/disaster-recovery.md) | Full system recovery scenarios |
+| [Backfill Stream Events](docs/runbooks/backfill-stream-events.md) | Replay Horizon events into `stream_events` after indexer downtime or decoder fix |
 
 See the full [runbooks index](docs/runbooks/README.md) for all operational procedures.
 
@@ -213,7 +216,7 @@ Updates the minimum total deposit threshold in instance storage. Default is 100 
 | 1 | `ScheduleNotFound` | No active schedule for the recipient |
 | 2 | `CliffNotReached` | Ledger is still before `cliff_ledger` |
 | 3 | `InvalidDuration` | `total_duration` ≤ `cliff_duration` |
-| 4 | `InvalidRate` | `rate` is zero or negative |
+| 4 | `InvalidRate` | `rate` is zero or negative; or `fee_bps` > 500 |
 | 5 | `DepositOverflow` | Arithmetic overflow computing total deposit |
 | 6 | `ScheduleAlreadyExists` | A stream already exists for this recipient |
 | 7 | `NothingToClaim` | Claimable amount is zero at current ledger |
@@ -221,6 +224,21 @@ Updates the minimum total deposit threshold in instance storage. Default is 100 
 | 9 | `TransferFailed` | Token transfer failed |
 | 10 | `DrainDelayNotExpired` | The 1-year drain delay after `end_ledger` has not passed |
 | 11 | `InvalidRecipient` | `sponsor` and `recipient` are the same address |
+| 12 | `InvalidCliffDuration` | `cliff_duration` is zero |
+| 13 | `AlreadyInitialized` | `initialize` has already been called |
+| 14 | `RecipientNotAllowed` | Recipient not on the configured allowlist |
+| 15 | `StreamPaused` | Claim attempted on a paused stream |
+| 16 | `BatchTooLarge` | Batch size exceeds the maximum of 20 |
+| 17 | `RateTooLow` | `rate × total_duration` is below the configured minimum |
+| 18 | `NotInitialized` | `initialize` has not yet been called |
+| 19 | `InvalidSegments` | Variable-rate segments are invalid (empty, out-of-order, or bad rate) |
+| 20 | `MetadataTooLong` | `metadata` exceeds 256 UTF-8 bytes |
+| 21 | `Unauthorized` | Caller is not the contract admin or original sponsor |
+| 22 | `DepositBelowMinimum` | Total deposit is below the configured minimum |
+| 23 | `StreamAlreadyPaused` | Stream is already paused |
+| 24 | `StreamNotPaused` | `resume_stream` called on a non-paused stream |
+| 25 | `VersionOverflow` | Version counter has reached `u32::MAX` |
+| 26 | `ClawbackNotSupported` | Token does not support the SAC clawback flag |
 
 ---
 
@@ -292,7 +310,8 @@ See [docs/sbom.md](docs/sbom.md) for the full policy, allowed license list, and 
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md) for a full history of notable changes.
+- [CHANGELOG.md](CHANGELOG.md) — Project-level changes and release history.
+- [API Changelog](docs/api-changelog.md) — Contract and backend API changes for integrators.
 
 ## License
 
