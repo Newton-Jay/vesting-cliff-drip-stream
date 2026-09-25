@@ -1,152 +1,332 @@
 #!/usr/bin/env tsx
 /**
- * scripts/backfill_stream_events.ts  (#286)
+ * scripts/backfill_stream_events.ts
  *
- * One-shot backfill script that replays all historical contract events from
+ * One-shot backfill script that replays historical contract events from
  * Horizon into the `stream_events` table.
  *
  * Usage:
  *   DATABASE_URL=postgres://... HORIZON_URL=https://... \
- *   TESTNET_CONTRACT_ID=C...    tsx scripts/backfill_stream_events.ts
+ *   tsx scripts/backfill_stream_events.ts \
+ *     [--from-ledger <n>] [--to-ledger <n>] [--dry-run]
  *
- * Options (env vars):
- *   BACKFILL_START_CURSOR   Horizon paging_token to resume from (default: "")
- *   BACKFILL_PAGE_LIMIT     Records per Horizon page (default: 200, max 200)
- *   BACKFILL_DRY_RUN        Set to "1" to log without writing to DB
- *   STELLAR_NETWORK         testnet | mainnet | futurenet (default: testnet)
+ * Options:
+ *   --from-ledger <n>       Backfill events from this ledger sequence (inclusive).
+ *                           Overrides BACKFILL_FROM_LEDGER env var.
+ *   --to-ledger <n>         Stop after this ledger sequence (inclusive).
+ *                           Overrides BACKFILL_TO_LEDGER env var.
+ *   --dry-run               Print events without writing to the database.
+ *                           Overrides BACKFILL_DRY_RUN=1 env var.
+ *
+ * Environment variables (used when CLI args are absent):
+ *   DATABASE_URL            PostgreSQL connection string (required).
+ *   HORIZON_URL             Horizon base URL (default: testnet).
+ *   BACKFILL_START_CURSOR   Horizon paging_token to resume from (default: "").
+ *   BACKFILL_PAGE_LIMIT     Records per Horizon page (default: 200, max 200).
+ *   BACKFILL_DRY_RUN        Set to "1" to log without writing to DB.
+ *   BACKFILL_FROM_LEDGER    Start ledger sequence (inclusive).
+ *   BACKFILL_TO_LEDGER      End ledger sequence (inclusive).
+ *   STELLAR_NETWORK         testnet | mainnet | futurenet (default: testnet).
  */
 
-import pg from "pg";
 import { networkConfig } from "../src/config/network.js";
+
+// ── CLI arg parsing ───────────────────────────────────────────────────────────
+
+function parseArgs(argv: string[]): {
+  fromLedger: number | null;
+  toLedger: number | null;
+  dryRun: boolean;
+} {
+  let fromLedger: number | null = null;
+  let toLedger: number | null = null;
+  let dryRun = false;
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "--dry-run") {
+      dryRun = true;
+    } else if (arg === "--from-ledger" && argv[i + 1] !== undefined) {
+      const v = parseInt(argv[++i], 10);
+      if (!isNaN(v) && v > 0) fromLedger = v;
+      else { console.error("[backfill] --from-ledger must be a positive integer"); process.exit(1); }
+    } else if (arg === "--to-ledger" && argv[i + 1] !== undefined) {
+      const v = parseInt(argv[++i], 10);
+      if (!isNaN(v) && v > 0) toLedger = v;
+      else { console.error("[backfill] --to-ledger must be a positive integer"); process.exit(1); }
+    }
+  }
+
+  return { fromLedger, toLedger, dryRun };
+}
+
+// node/tsx passes script args starting at index 2
+const args = parseArgs(process.argv.slice(2));
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const DATABASE_URL = process.env.DATABASE_URL;
-if (!DATABASE_URL) {
-  console.error("[backfill] DATABASE_URL is required");
-  process.exit(1);
+
+function printUsage(): void {
+  console.log(`
+Usage:
+  tsx scripts/backfill_stream_events.ts \\
+    --from-ledger <n> --to-ledger <n> [--dry-run]
+
+Required:
+  --from-ledger <n>   First ledger to include (inclusive)
+  --to-ledger   <n>   Last ledger to include  (inclusive)
+
+Optional:
+  --dry-run           Decode and print events; do not write to DB
+  --help              Show this message
+
+Environment:
+  DATABASE_URL          PostgreSQL connection string (not required with --dry-run)
+  HORIZON_URL           Horizon base URL
+  STELLAR_NETWORK       testnet | mainnet | futurenet
+  TESTNET_CONTRACT_ID   Contract ID on testnet (or MAINNET_CONTRACT_ID etc.)
+  BACKFILL_PAGE_LIMIT   Horizon page size (default: 200, max: 200)
+`.trim());
 }
+
+// ── CLI argument parsing ──────────────────────────────────────────────────────
+
+function parseArgs(argv: string[]): {
+  fromLedger: number;
+  toLedger: number;
+  dryRun: boolean;
+} {
+  let fromLedger: number | null = null;
+  let toLedger: number | null = null;
+  let dryRun = false;
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "--from-ledger" || arg === "--from_ledger") {
+      const val = parseInt(argv[++i] ?? "", 10);
+      if (isNaN(val) || val < 0) fatal(`--from-ledger must be a non-negative integer, got: ${argv[i]}`);
+      fromLedger = val;
+    } else if (arg === "--to-ledger" || arg === "--to_ledger") {
+      const val = parseInt(argv[++i] ?? "", 10);
+      if (isNaN(val) || val < 0) fatal(`--to-ledger must be a non-negative integer, got: ${argv[i]}`);
+      toLedger = val;
+    } else if (arg === "--dry-run" || arg === "--dry_run") {
+      dryRun = true;
+    } else if (arg === "--help" || arg === "-h") {
+      printUsage();
+      process.exit(0);
+    }
+  }
+
+  if (fromLedger === null) fatal("--from-ledger is required");
+  if (toLedger === null)   fatal("--to-ledger is required");
+  if (fromLedger! > toLedger!) fatal(`--from-ledger (${fromLedger}) must be ≤ --to-ledger (${toLedger})`);
+
+  return { fromLedger: fromLedger!, toLedger: toLedger!, dryRun };
+}
+
+// ── Config ────────────────────────────────────────────────────────────────────
+
+const { fromLedger, toLedger, dryRun } = parseArgs(process.argv.slice(2));
 
 const HORIZON_URL =
   process.env.HORIZON_URL ?? "https://horizon-testnet.stellar.org";
-const CONTRACT_ID = networkConfig.contractId;
-if (!CONTRACT_ID) {
-  console.error("[backfill] CONTRACT_ID is not set (check TESTNET_CONTRACT_ID / MAINNET_CONTRACT_ID)");
-  process.exit(1);
-}
+
+// networkConfig.contractId may be an empty string when the env var is unset.
+// We allow that here so that test files can import the module without setting
+// TESTNET_CONTRACT_ID; the run() function validates it before use.
+const CONTRACT_ID: string = networkConfig.contractId || "";
 
 const PAGE_LIMIT = Math.min(
   200,
   parseInt(process.env.BACKFILL_PAGE_LIMIT ?? "200", 10)
 );
-const DRY_RUN = process.env.BACKFILL_DRY_RUN === "1";
+
+// CLI args take priority over env vars; env vars fall back to null/default.
+const DRY_RUN =
+  args.dryRun || process.env.BACKFILL_DRY_RUN === "1";
+
+const FROM_LEDGER: number | null =
+  args.fromLedger ??
+  (process.env.BACKFILL_FROM_LEDGER
+    ? parseInt(process.env.BACKFILL_FROM_LEDGER, 10)
+    : null);
+
+const TO_LEDGER: number | null =
+  args.toLedger ??
+  (process.env.BACKFILL_TO_LEDGER
+    ? parseInt(process.env.BACKFILL_TO_LEDGER, 10)
+    : null);
+
+// Validate ledger range
+if (FROM_LEDGER !== null && TO_LEDGER !== null && FROM_LEDGER > TO_LEDGER) {
+  console.error("[backfill] --from-ledger must be ≤ --to-ledger");
+  process.exit(1);
+}
+
 let startCursor = process.env.BACKFILL_START_CURSOR ?? "";
 
-// ── DB pool ───────────────────────────────────────────────────────────────────
+const DATABASE_URL = process.env.DATABASE_URL;
+if (!dryRun && !DATABASE_URL) {
+  fatal("DATABASE_URL is required (or pass --dry-run to skip DB writes)");
+}
 
-const pool = new pg.Pool({ connectionString: DATABASE_URL, max: 3 });
+// Pool is lazily created inside run() after validation; exported for tests.
+let pool: pg.Pool;
 
-// ── Event decoding ────────────────────────────────────────────────────────────
+export function createPool(connectionString: string): pg.Pool {
+  pool = new pg.Pool({ connectionString, max: 3 });
+  return pool;
+}
 
-type EventType = "vc_create" | "vc_claim" | "vc_cancel" | "vc_done" | "vc_drain";
+// ── Progress bar ──────────────────────────────────────────────────────────────
 
-interface DecodedEvent {
+/**
+ * Renders a simple inline progress bar to stdout.
+ * Uses process.stdout.write with a carriage-return so it updates in-place.
+ *
+ * @param fetched  Total events fetched so far.
+ * @param inserted Events actually written to the DB.
+ * @param page     Current Horizon page number.
+ * @param done     If true, prints a final newline.
+ */
+export function renderProgress(
+  fetched: number,
+  inserted: number,
+  page: number,
+  done = false
+): void {
+  const barWidth = 20;
+  // We don't know the total ahead of time, so show a spinner-style counter.
+  const filled = page % (barWidth + 1);
+  const bar = "█".repeat(filled) + "░".repeat(barWidth - filled);
+  const line = `[backfill] [${bar}] page=${page} fetched=${fetched} inserted=${inserted}`;
+
+  if (process.stdout.isTTY) {
+    // Overwrite current line in an interactive terminal.
+    process.stdout.write(`\r${line}${done ? "\n" : ""}`);
+  } else {
+    // Non-TTY (CI, redirected output): only print at page boundaries and done.
+    if (done || page % 10 === 0) {
+      process.stdout.write(line + "\n");
+    }
+  }
+}
+
+let _pool: any = null;
+
+function getPool(): any {
+  if (!_pool) {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { Pool } = require("pg");
+    _pool = new Pool({ connectionString: DATABASE_URL!, max: 3 });
+  }
+  return _pool;
+}
+
+// ── Event types ───────────────────────────────────────────────────────────────
+
+type EventType =
+  | "vc_create"
+  | "vc_claim"
+  | "vc_cancel"
+  | "vc_done"
+  | "vc_drain";
+
+export interface DecodedEvent {
   event_type: EventType;
   recipient: string;
   sponsor: string | null;
   token: string | null;
   amount: bigint | null;
   ledger_sequence: number;
-  tx_hash: string;
+  tx_hash:         string;
 }
 
 const KNOWN_EVENT_TYPES = new Set<EventType>([
-  "vc_create",
-  "vc_claim",
-  "vc_cancel",
-  "vc_done",
-  "vc_drain",
+  "vc_create", "vc_claim", "vc_cancel", "vc_done", "vc_drain",
 ]);
 
-function decodeSymbol(xdr: string): string {
+export function decodeSymbol(xdr: string): string {
   try {
     const buf = Buffer.from(xdr, "base64");
-    // XDR ScSymbol: 4-byte tag (0x00000006) + 4-byte length + bytes
-    if (buf.length > 8) {
-      return buf.subarray(8).toString("utf8").replace(/\0/g, "").trim();
-    }
+    if (buf.length > 8) return buf.subarray(8).toString("utf8").replace(/\0/g, "").trim();
     return buf.toString("utf8").replace(/[^\x20-\x7e]/g, "").trim();
-  } catch {
-    return xdr;
-  }
+  } catch { return xdr; }
 }
 
-function decodeAddress(xdr: string): string {
+export function decodeAddress(xdr: string): string {
   // Best-effort: XDR Address ScVal is complex; return raw for now.
   // A full decode would use StellarBase.xdr.ScVal.fromXDR().
   return xdr;
 }
 
-function decodeBigInt(xdr: string | undefined): bigint | null {
+export function decodeBigInt(xdr: string | undefined): bigint | null {
   if (!xdr) return null;
   try {
     const buf = Buffer.from(xdr, "base64");
-    // ScVal I128 / U64 / U32 — read last 8 bytes as unsigned big-endian
+    // ScVal I128 / U64 / U32 — read last 8 bytes as signed big-endian
     if (buf.length >= 8) {
       return buf.readBigInt64BE(buf.length - 8);
     }
+    if (buf.length >= 8) return buf.readBigInt64BE(buf.length - 8);
     return null;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
-function decodeEvent(record: any): DecodedEvent | null {
+export function decodeEvent(record: any): DecodedEvent | null {
   try {
     const topics: string[] = record.topic ?? [];
-    const rawType = decodeSymbol(topics[0] ?? "");
+    const rawType   = decodeSymbol(topics[0] ?? "");
     const eventType = rawType as EventType;
-
-    if (!KNOWN_EVENT_TYPES.has(eventType)) {
-      return null; // Not one of ours
-    }
+    if (!KNOWN_EVENT_TYPES.has(eventType)) return null;
 
     const recipient = decodeAddress(topics[1] ?? "");
     const txHash: string =
-      record.transaction_hash ?? record.id?.split("-")[0] ?? record.id ?? "";
+      record.transaction_hash ??
+      record.id?.split("-")[0] ??
+      record.id ??
+      "";
 
     const ledger: number =
       typeof record.ledger === "number"
         ? record.ledger
         : parseInt(String(record.ledger ?? "0"), 10);
 
+    // If a ledger range is active, skip events outside the window.
+    if (FROM_LEDGER !== null && ledger < FROM_LEDGER) return null;
+    if (TO_LEDGER !== null && ledger > TO_LEDGER) return null;
+
     const valueFields: string[] = record.value?.xdr
       ? [record.value.xdr]
-      : Array.isArray(record.value)
-      ? record.value
-      : [];
+      : Array.isArray(record.value) ? record.value : [];
 
     let sponsor: string | null = null;
-    let token: string | null = null;
-    let amount: bigint | null = null;
+    let token:   string | null = null;
+    let amount:  bigint | null = null;
 
     if (eventType === "vc_create") {
-      // Data tuple: (sponsor, token, rate, start_ledger, cliff_ledger, end_ledger)
       sponsor = decodeAddress(topics[2] ?? valueFields[0] ?? "");
-      token = decodeAddress(valueFields[1] ?? "");
-    } else if (eventType === "vc_claim") {
-      // Data: (amount, ledger_claimed_through)
-      amount = decodeBigInt(valueFields[0]);
-    } else if (eventType === "vc_cancel") {
-      // Data: refunded_amount
+      token   = decodeAddress(valueFields[1] ?? "");
+    } else if (eventType === "vc_claim" || eventType === "vc_cancel") {
       amount = decodeBigInt(valueFields[0]);
     } else if (eventType === "vc_drain") {
-      // Data: (sponsor, amount)
       sponsor = decodeAddress(valueFields[0] ?? "");
-      amount = decodeBigInt(valueFields[1]);
+      amount  = decodeBigInt(valueFields[1]);
+    } else if (eventType === "vc_done") {
+      token = decodeAddress(valueFields[0] ?? "");
     }
 
-    return { event_type: eventType, recipient, sponsor, token, amount, ledger_sequence: ledger, tx_hash: txHash };
+    return {
+      event_type: eventType,
+      recipient,
+      sponsor,
+      token,
+      amount,
+      ledger_sequence: ledger,
+      tx_hash: txHash,
+    };
   } catch (err) {
     console.warn("[backfill] decode error:", err);
     return null;
@@ -155,9 +335,9 @@ function decodeEvent(record: any): DecodedEvent | null {
 
 // ── DB write ──────────────────────────────────────────────────────────────────
 
-async function upsertEvents(events: DecodedEvent[]): Promise<number> {
+export async function upsertEvents(events: DecodedEvent[]): Promise<number> {
   if (events.length === 0) return 0;
-
+  const pool   = getPool();
   const client = await pool.connect();
   let inserted = 0;
   try {
@@ -166,7 +346,7 @@ async function upsertEvents(events: DecodedEvent[]): Promise<number> {
       const result = await client.query(
         `INSERT INTO stream_events
            (event_type, recipient, sponsor, token, amount, ledger_sequence, tx_hash)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)
          ON CONFLICT (tx_hash) DO NOTHING`,
         [
           ev.event_type,
@@ -191,16 +371,16 @@ async function upsertEvents(events: DecodedEvent[]): Promise<number> {
 }
 
 async function insertDlq(record: any, error: string): Promise<void> {
+  const pool   = getPool();
   const client = await pool.connect();
   try {
     await client.query(
       `INSERT INTO stream_events_dlq (horizon_event_id, raw_payload, last_error)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (horizon_event_id)
-       DO UPDATE SET
+       VALUES ($1,$2,$3)
+       ON CONFLICT (horizon_event_id) DO UPDATE SET
          attempt_count = stream_events_dlq.attempt_count + 1,
-         last_error = EXCLUDED.last_error,
-         updated_at = now()`,
+         last_error    = EXCLUDED.last_error,
+         updated_at    = now()`,
       [record.id ?? "", JSON.stringify(record), error]
     );
   } finally {
@@ -208,94 +388,184 @@ async function insertDlq(record: any, error: string): Promise<void> {
   }
 }
 
-// ── Main loop ─────────────────────────────────────────────────────────────────
+// ── Horizon fetch ─────────────────────────────────────────────────────────────
 
-async function fetchPage(cursor: string): Promise<{
+export async function fetchPage(
+  cursor: string,
+  horizonUrl: string = HORIZON_URL,
+  contractId: string = CONTRACT_ID
+): Promise<{
   records: any[];
   nextCursor: string | null;
 }> {
-  const url = new URL(`${HORIZON_URL}/contracts/${CONTRACT_ID}/events`);
+  const url = new URL(`${horizonUrl}/contracts/${contractId}/events`);
   url.searchParams.set("limit", String(PAGE_LIMIT));
   url.searchParams.set("order", "asc");
   if (cursor) url.searchParams.set("cursor", cursor);
 
   const resp = await fetch(url.toString());
   if (!resp.ok) {
-    throw new Error(`Horizon HTTP ${resp.status}: ${await resp.text()}`);
+    const body = await resp.text().catch(() => "");
+    throw new Error(`Horizon HTTP ${resp.status}: ${body.slice(0, 200)}`);
   }
 
-  const data: any = await resp.json();
+  const data: any    = await resp.json();
   const records: any[] = data._embedded?.records ?? [];
-  const nextCursor =
-    records.length > 0
-      ? (records[records.length - 1].paging_token as string)
-      : null;
 
-  return { records, nextCursor };
+  if (records.length === 0) return { records: [], nextCursor: null, done: true };
+
+  const nextCursor  = records[records.length - 1].paging_token as string;
+  const lastLedger  = typeof records[records.length - 1].ledger === "number"
+    ? records[records.length - 1].ledger
+    : parseInt(String(records[records.length - 1].ledger ?? "0"), 10);
+
+  const done = lastLedger > toLedger || records.length < PAGE_LIMIT;
+
+  return { records, nextCursor, done };
 }
 
-async function run(): Promise<void> {
-  console.log(`[backfill] Starting. contract=${CONTRACT_ID} horizon=${HORIZON_URL}`);
-  if (DRY_RUN) console.log("[backfill] DRY_RUN=1 — no DB writes");
+// ── Main loop ─────────────────────────────────────────────────────────────────
 
-  let totalFetched = 0;
+export async function run(): Promise<void> {
+  // Validate required configuration before touching the network or DB.
+  if (!DATABASE_URL) {
+    console.error("[backfill] DATABASE_URL is required");
+    process.exit(1);
+  }
+  if (!CONTRACT_ID) {
+    console.error(
+      "[backfill] CONTRACT_ID is not set (check TESTNET_CONTRACT_ID / MAINNET_CONTRACT_ID)"
+    );
+    process.exit(1);
+  }
+
+  // Initialise the pool now that we know DATABASE_URL is set.
+  createPool(DATABASE_URL);
+  const rangeDesc =
+    FROM_LEDGER !== null || TO_LEDGER !== null
+      ? ` ledgers=[${FROM_LEDGER ?? "start"}..${TO_LEDGER ?? "end"}]`
+      : "";
+
+  console.log(
+    `[backfill] Starting. contract=${CONTRACT_ID} horizon=${HORIZON_URL}${rangeDesc}`
+  );
+  if (DRY_RUN) console.log("[backfill] DRY_RUN — no DB writes");
+
+const BAR_WIDTH = 40;
+
+function renderProgress(
+  currentLedger: number,
+  totalLedgers:  number,
+  fetched:       number,
+  inserted:      number,
+  skipped:       number,
+): void {
+  if (!process.stdout.isTTY) return; // suppress in CI / pipes
+
+  const pct    = totalLedgers > 0 ? Math.min(1, (currentLedger - fromLedger) / totalLedgers) : 0;
+  const filled = Math.round(pct * BAR_WIDTH);
+  const bar    = "█".repeat(filled) + "░".repeat(BAR_WIDTH - filled);
+  const pctStr = (pct * 100).toFixed(1).padStart(5);
+
+  process.stdout.write(
+    `\r[${bar}] ${pctStr}%  ` +
+    `ledger=${currentLedger.toLocaleString()}  ` +
+    `fetched=${fetched.toLocaleString()}  ` +
+    `ins=${inserted.toLocaleString()}  ` +
+    `skip=${skipped.toLocaleString()}   `
+  );
+}
+
+function clearProgress(): void {
+  if (process.stdout.isTTY) process.stdout.write("\n");
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+
+async function run(): Promise<void> {
+  const rangeWidth = toLedger - fromLedger;
+
+  console.log("[backfill] ─────────────────────────────────────────────");
+  console.log(`[backfill] contract    : ${CONTRACT_ID}`);
+  console.log(`[backfill] horizon     : ${HORIZON_URL}`);
+  console.log(`[backfill] from-ledger : ${fromLedger.toLocaleString()}`);
+  console.log(`[backfill] to-ledger   : ${toLedger.toLocaleString()}`);
+  console.log(`[backfill] dry-run     : ${dryRun}`);
+  console.log("[backfill] ─────────────────────────────────────────────");
+
+  let totalFetched  = 0;
+  let totalInRange  = 0;
   let totalInserted = 0;
   let totalSkipped = 0;
   let totalDlq = 0;
   let cursor = startCursor;
   let page = 0;
+  let pastToLedger = false;
 
-  while (true) {
+  while (!pastToLedger) {
     page++;
-    console.log(`[backfill] Fetching page ${page}, cursor="${cursor}"`);
 
     let records: any[];
     let nextCursor: string | null;
+    let done: boolean;
 
     try {
-      ({ records, nextCursor } = await fetchPage(cursor));
+      ({ records, nextCursor, done } = await fetchPage(cursor));
     } catch (err) {
+      // Flush progress bar before error output
+      if (process.stdout.isTTY) process.stdout.write("\n");
       console.error("[backfill] Horizon fetch error:", err);
       console.error(`[backfill] Resume with: BACKFILL_START_CURSOR="${cursor}"`);
+      await pool.end();
       process.exit(1);
     }
 
     if (records.length === 0) {
-      console.log("[backfill] No more records.");
       break;
     }
 
     totalFetched += records.length;
 
     const decoded: DecodedEvent[] = [];
+
     for (const rec of records) {
       try {
         const ev = decodeEvent(rec);
         if (ev) {
+          totalInRange++;
           decoded.push(ev);
+
+          // If we've passed the to-ledger boundary, stop after this page.
+          if (TO_LEDGER !== null && ev.ledger_sequence > TO_LEDGER) {
+            pastToLedger = true;
+          }
         } else {
           totalSkipped++;
         }
+        // Events outside the range are silently dropped (decodeEvent returns null)
       } catch (err) {
         totalDlq++;
-        if (!DRY_RUN) {
-          await insertDlq(rec, String(err));
+        if (!dryRun) {
+          await insertDlq(rec, String(err)).catch((e) =>
+            console.warn("[backfill] DLQ write failed:", e)
+          );
         }
-        console.warn(`[backfill] Failed to decode event ${rec.id}, sent to DLQ`);
       }
     }
 
-    if (!DRY_RUN && decoded.length > 0) {
+    if (DRY_RUN) {
+      for (const ev of decoded) {
+        console.log(
+          `[backfill] [dry-run] ${ev.event_type} ledger=${ev.ledger_sequence} tx=${ev.tx_hash} recipient=${ev.recipient}`
+        );
+      }
+    } else if (decoded.length > 0) {
       const inserted = await upsertEvents(decoded);
       totalInserted += inserted;
-      console.log(
-        `[backfill] Page ${page}: fetched=${records.length} decoded=${decoded.length} inserted=${inserted}`
-      );
-    } else {
-      console.log(
-        `[backfill] Page ${page}: fetched=${records.length} decoded=${decoded.length} (dry-run)`
-      );
     }
+
+    // Render progress bar
+    renderProgress(totalFetched, totalInserted, page);
 
     if (!nextCursor || records.length < PAGE_LIMIT) {
       break; // Reached end of event stream
@@ -303,13 +573,25 @@ async function run(): Promise<void> {
     cursor = nextCursor;
   }
 
+  // Final progress bar line
+  renderProgress(totalFetched, totalInserted, page, true);
+
   console.log(
     `[backfill] Done. fetched=${totalFetched} inserted=${totalInserted} skipped=${totalSkipped} dlq=${totalDlq}`
   );
   await pool.end();
 }
 
-run().catch((err) => {
-  console.error("[backfill] Fatal:", err);
-  process.exit(1);
-});
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+// Allow importing in tests without auto-running
+if (
+  process.argv[1] &&
+  (process.argv[1].endsWith("backfill_stream_events.ts") ||
+    process.argv[1].endsWith("backfill_stream_events.js"))
+) {
+  run().catch((err) => {
+    console.error("[backfill] Fatal:", err);
+    process.exit(1);
+  });
+}
